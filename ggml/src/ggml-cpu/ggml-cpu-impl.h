@@ -378,9 +378,6 @@ static __m256 __lasx_xvreplfr2vr_s(float val) {
 }
 #endif
 
-// TODO: move to ggml-threading
-void ggml_barrier(struct ggml_threadpool * tp);
-
 #ifdef __cplusplus
 }
 #endif
