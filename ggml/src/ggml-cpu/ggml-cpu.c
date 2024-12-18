@@ -33,7 +33,10 @@
 #include <stdarg.h>
 #include <signal.h>
 #if defined(__gnu_linux__)
+#include <pthread.h>
+#include <sched.h>
 #include <syscall.h>
+#include <sys/stat.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -12876,7 +12879,7 @@ struct ggml_cplan ggml_graph_plan(
         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
     }
     if (n_threads <= 0) {
-        n_threads = threadpool ? threadpool->n_threads_max : GGML_DEFAULT_N_THREADS;
+        n_threads = threadpool ? ggml_threadpool_get_n_threads_max(threadpool) : GGML_DEFAULT_N_THREADS;
     }
 
     size_t work_size = 0;
@@ -13049,40 +13052,6 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-static thread_ret_t ggml_graph_compute_thread(void * data) {
-    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
-    struct ggml_threadpool    * tp    = state->threadpool;
-
-    const struct ggml_cgraph * cgraph = tp->cgraph;
-    const struct ggml_cplan  * cplan  = tp->cplan;
-
-    set_numa_thread_affinity(state->ith);
-
-    struct ggml_compute_params params = {
-        /*.ith       =*/ state->ith,
-        /*.nth       =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
-        /*.wsize     =*/ cplan->work_size,
-        /*.wdata     =*/ cplan->work_data,
-        /*.threadpool=*/ tp,
-    };
-
-    for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
-        struct ggml_tensor * node = cgraph->nodes[node_n];
-
-        ggml_compute_forward(&params, node);
-
-        if (state->ith == 0 && cplan->abort_callback &&
-                cplan->abort_callback(cplan->abort_callback_data)) {
-            tp->abort = true;
-            tp->ec    = GGML_STATUS_ABORTED;
-        }
-
-        ggml_barrier(state->threadpool);
-    }
-
-    return 0;
-}
-
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -13104,7 +13073,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
-        ggml_threadpool_reset(threadpool);
+        ggml_threadpool_reset(threadpool, cgraph);
     }
 
 #ifdef GGML_USE_OPENMP
@@ -13124,7 +13093,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 #else
     if (n_threads > ggml_threadpool_get_n_threads_max(threadpool)) {
-        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
+        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, ggml_threadpool_get_n_threads_max(threadpool));
         n_threads = ggml_threadpool_get_n_threads_max(threadpool);
     }
 

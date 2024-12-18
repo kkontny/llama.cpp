@@ -15,18 +15,6 @@
 extern "C" {
 #endif
 
-struct ggml_compute_params {
-    // ith = thread index, nth = number of threads
-    int ith, nth;
-
-    // work buffer for all threads
-    size_t wsize;
-    void * wdata;
-
-    struct ggml_threadpool * threadpool;
-};
-
-
 #if defined(_MSC_VER)
 
 #define m512bh(p) p
