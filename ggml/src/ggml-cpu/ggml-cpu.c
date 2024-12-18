@@ -13090,7 +13090,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
-    int n_threads                               = cplan->n_threads;
+    int n_threads = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     bool disposable_threadpool = false;
@@ -13100,15 +13100,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
-        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        threadpool = ggml_threadpool_new(&ttp, ggml_graph_compute_thread);
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
-        threadpool->cgraph           = cgraph;
-        threadpool->cplan            = cplan;
-        threadpool->current_chunk    = 0;
-        threadpool->abort            = false;
-        threadpool->ec               = GGML_STATUS_SUCCESS;
+        ggml_threadpool_reset(threadpool);
     }
 
 #ifdef GGML_USE_OPENMP
@@ -13118,27 +13114,25 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             #pragma omp single
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
-                n_threads = omp_get_num_threads();
-                atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
+                ggml_threadpool_set_n_threads(omp_get_num_threads());
             }
-
-            ggml_graph_compute_thread(&threadpool->workers[omp_get_thread_num()]);
+            ggml_threadpool_run(omp_get_thread_num())
         }
     } else {
-        atomic_store_explicit(&threadpool->n_threads_cur, 1, memory_order_relaxed);
-        ggml_graph_compute_thread(&threadpool->workers[0]);
+        ggml_threadpool_set_n_threads(1);
+        ggml_threadpool_run(0);
     }
 #else
-    if (n_threads > threadpool->n_threads_max) {
+    if (n_threads > ggml_threadpool_get_n_threads_max(threadpool)) {
         GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
-        n_threads = threadpool->n_threads_max;
+        n_threads = ggml_threadpool_get_n_threads_max(threadpool);
     }
 
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
-    ggml_graph_compute_thread(&threadpool->workers[0]);
+    ggml_threadpool_run(0);
 #endif
 
     // don't leave affinity set on the main thread

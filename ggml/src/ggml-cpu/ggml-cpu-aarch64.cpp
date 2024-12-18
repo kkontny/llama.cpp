@@ -8,6 +8,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-cpu-traits.h"
+#include "ggml-threading.h"
 
 #include <cmath>
 #include <cstring>
