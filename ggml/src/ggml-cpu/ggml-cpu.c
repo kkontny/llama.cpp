@@ -12856,7 +12856,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
-        ggml_threadpool_reset(threadpool, cgraph);
+        ggml_threadpool_reset(threadpool, cgraph, cplan->abort_callback, cplan->abort_callback_data);
     }
 
 #ifdef GGML_USE_OPENMP
@@ -12868,11 +12868,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 ggml_threadpool_set_n_threads(omp_get_num_threads());
             }
-            ggml_threadpool_run(omp_get_thread_num())
+            ggml_graph_compute_thread(threadpool, omp_get_thread_num())
         }
     } else {
-        ggml_threadpool_set_n_threads(1);
-        ggml_threadpool_run(0);
+        ggml_threadpool_set_n_threads(threadpool, 1);
+        ggml_graph_compute_thread(threadpool, 0);
     }
 #else
     if (n_threads > ggml_threadpool_get_n_threads_max(threadpool)) {
@@ -12884,7 +12884,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
-    ggml_threadpool_run(0);
+    ggml_graph_compute_thread(threadpool, 0);
 #endif
 
     // don't leave affinity set on the main thread
