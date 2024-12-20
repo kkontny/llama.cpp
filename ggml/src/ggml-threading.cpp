@@ -332,17 +332,16 @@ struct alignas(std::hardware_destructive_interference_size) ggml_threadpool {
     std::atomic_int n_graph;       // incremented when there is work to be done (i.e each graph)
     alignas(std::hardware_destructive_interference_size) std::atomic_int n_barrier;
     alignas(std::hardware_destructive_interference_size) std::atomic_int n_barrier_passed;
-    std::atomic_int current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
 
     // these are atomic as an annotation for thread-sanitizer
     std::atomic_bool stop;         // Used for stopping the threadpool altogether
     std::atomic_bool pause;        // Used for pausing the threadpool or individual threads
     std::atomic_bool abort;        // Used for aborting processing of a graph
-    ggml_abort_callback abort_callback;
-    void *              abort_callback_data;
+
+    void * backend_ctx; // Additional per backend information
 
     ggml_compute_state * workers;   // per thread state
-    void (*compute_function) (void * data, ggml_tensor * node);  // function to run by each worker thread
+    void (*compute_thread) (void * data);  // function to run by each worker thread
     int               n_threads_max; // number of threads in the pool
     std::atomic_int   n_threads_cur; // number of threads used in the current graph
 
@@ -667,7 +666,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         ggml_thread_apply_affinity(state->cpumask);
     }
 
-    GGML_ASSERT(threadpool->compute_function);
+    GGML_ASSERT(threadpool->compute_thread);
 
     while (true) {
         // Check if we need to sleep
@@ -690,7 +689,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         ggml_graph_compute_check_for_work(state);
         if (state->pending) {
             state->pending = false;
-            ggml_graph_compute_thread(threadpool, state->ith);
+            threadpool->compute_thread(state);
         }
     }
 
@@ -733,27 +732,25 @@ void ggml_graph_compute_kickoff(ggml_threadpool * threadpool, int n_threads)
 
 ggml_threadpool * ggml_threadpool_new(
     ggml_threadpool_params * tpp,
-    void (*compute_function) (void * data, ggml_tensor * node)) {
+    void (*compute_thread) (void * data)) {
 
     ggml_threadpool * threadpool = new ggml_threadpool;
     {
-        threadpool->cgraph              = nullptr;
-        threadpool->n_graph             = 0;
-        threadpool->n_barrier           = 0;
-        threadpool->n_barrier_passed    = 0;
-        threadpool->current_chunk       = 0;
-        threadpool->stop                = false;
-        threadpool->pause               = tpp->paused;
-        threadpool->abort_callback      = nullptr;
-        threadpool->abort_callback_data = nullptr;
-        threadpool->abort               = false;
-        threadpool->workers             = nullptr;
-        threadpool->compute_function    = compute_function;
-        threadpool->n_threads_max       = tpp->n_threads;
-        threadpool->n_threads_cur       = tpp->n_threads;
-        threadpool->poll                = tpp->poll;
-        threadpool->prio                = tpp->prio;
-        threadpool->ec                  = GGML_STATUS_SUCCESS;
+        threadpool->cgraph           = nullptr;
+        threadpool->n_graph          = 0;
+        threadpool->n_barrier        = 0;
+        threadpool->n_barrier_passed = 0;
+        threadpool->stop             = false;
+        threadpool->pause            = tpp->paused;
+        threadpool->abort            = false;
+        threadpool->backend_ctx      = nullptr;
+        threadpool->workers          = nullptr;
+        threadpool->compute_thread   = compute_thread;
+        threadpool->n_threads_max    = tpp->n_threads;
+        threadpool->n_threads_cur    = tpp->n_threads;
+        threadpool->poll             = tpp->poll;
+        threadpool->prio             = tpp->prio;
+        threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
     // Allocate and init workers state
@@ -860,45 +857,17 @@ int ggml_threadpool_get_n_threads_max(ggml_threadpool * threadpool) {
     return threadpool->n_threads_max;
 }
 
-void ggml_threadpool_reset(ggml_threadpool * threadpool,
-                           ggml_cgraph * cgraph, 
-                           ggml_abort_callback abort_callback,
-                           void * abort_callback_data) {
-    threadpool->cgraph              = cgraph;
-    threadpool->current_chunk       = 0;
-    threadpool->abort               = false;
-    threadpool->abort_callback      = abort_callback;
-    threadpool->abort_callback_data = abort_callback_data;
-    threadpool->ec                  = GGML_STATUS_SUCCESS;
+void ggml_threadpool_run(ggml_threadpool * threadpool, int thread_id) {
+    threadpool->compute_thread(&threadpool->workers[thread_id]);
 }
 
-void ggml_graph_compute_thread(ggml_threadpool * threadpool, int thread_id) {
-
-    struct ggml_compute_state * state = &threadpool->workers[thread_id];
-
-    const ggml_cgraph * cgraph = threadpool->cgraph;
-
-    set_numa_thread_affinity(state->ith);
-
-    struct ggml_compute_params params = {
-        /*.ith       =*/ state->ith,
-        /*.nth       =*/ std::atomic_load_explicit(&threadpool->n_threads_cur, std::memory_order_relaxed),
-        /*.threadpool=*/ threadpool,
-    };
-
-    for (int node_n = 0; node_n < cgraph->n_nodes && !threadpool->abort; node_n++) {
-        struct ggml_tensor * node = cgraph->nodes[node_n];
-
-        threadpool->compute_function(&params, node);
-
-        if (state->ith == 0 && threadpool->abort_callback &&
-                threadpool->abort_callback(threadpool->abort_callback_data)) {
-            threadpool->abort = true;
-            threadpool->ec    = GGML_STATUS_ABORTED;
-        }
-
-        ggml_barrier(state->threadpool);
-    }
+void ggml_threadpool_reset(ggml_threadpool * threadpool,
+                           ggml_cgraph * cgraph,
+                           void * backend_ctx) {
+    threadpool->cgraph              = cgraph;
+    threadpool->backend_ctx         = backend_ctx;
+    threadpool->abort               = false;
+    threadpool->ec                  = GGML_STATUS_SUCCESS;
 }
 
 void ggml_barrier(ggml_threadpool * threadpool) {

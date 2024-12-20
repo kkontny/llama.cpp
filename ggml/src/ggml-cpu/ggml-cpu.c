@@ -7063,7 +7063,8 @@ UseGgmlGemm1:;
 
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        struct ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) params->threadpool->ctx;
+        atomic_store_explicit(&ctx->current_chunk, nth, memory_order_relaxed);
     }
 
     ggml_barrier(params->threadpool);
@@ -7128,6 +7129,8 @@ UseGgmlGemm2:;
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
 
+    struct ggml_backend_cpu_context * ctx = (ggml_backend_cpu_context *) params->threadpool->ctx;
+
     while (current_chunk < nchunk0 * nchunk1) {
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
@@ -7153,7 +7156,7 @@ UseGgmlGemm2:;
             break;
         }
 
-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+        current_chunk = atomic_fetch_add_explicit(&ctx->current_chunk, 1, memory_order_relaxed);
     }
 }
 
@@ -12835,15 +12838,46 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+void ggml_graph_compute_thread(ggml_threadpool * threadpool, int thread_id) {
+
+    struct ggml_compute_state * state = &threadpool->workers[thread_id];
+
+    const ggml_cgraph * cgraph = threadpool->cgraph;
+
+    set_numa_thread_affinity(state->ith);
+
+    struct ggml_compute_params params = {
+        /*.ith       =*/ state->ith,
+        /*.nth       =*/ std::atomic_load_explicit(&threadpool->n_threads_cur, std::memory_order_relaxed),
+        /*.wsize     =*/ cplan->work_size,
+        /*.wdata     =*/ cplan->work_data,
+        /*.threadpool=*/ threadpool,
+    };
+
+    for (int node_n = 0; node_n < cgraph->n_nodes && !threadpool->abort; node_n++) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+
+        threadpool->compute_function(&params, node);
+
+        if (state->ith == 0 && threadpool->abort_callback &&
+                threadpool->abort_callback(threadpool->abort_callback_data)) {
+            threadpool->abort = true;
+            threadpool->ec    = GGML_STATUS_ABORTED;
+        }
+
+        ggml_barrier(state->threadpool);
+    }
+}
+
+enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_backend_cpu_context * ctx) {
     ggml_cpu_init();
 
-    GGML_ASSERT(cplan);
-    GGML_ASSERT(cplan->n_threads > 0);
-    GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+    GGML_ASSERT(ctx);
+    GGML_ASSERT(ctx->n_threads > 0);
+    GGML_ASSERT(ctx->work_size == 0 || ctx->work_data != NULL);
 
-    int n_threads = cplan->n_threads;
-    struct ggml_threadpool * threadpool = cplan->threadpool;
+    int n_threads = ctx->n_threads;
+    struct ggml_threadpool * threadpool = ctx->threadpool;
 
     bool disposable_threadpool = false;
 
@@ -12856,7 +12890,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
-        ggml_threadpool_reset(threadpool, cgraph, cplan->abort_callback, cplan->abort_callback_data);
+        ctx->current_chunk = 0;
+        ggml_threadpool_reset(threadpool, cgraph, ctx);
     }
 
 #ifdef GGML_USE_OPENMP
@@ -12868,11 +12903,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 ggml_threadpool_set_n_threads(omp_get_num_threads());
             }
-            ggml_graph_compute_thread(threadpool, omp_get_thread_num())
+            ggml_threadpool_run(threadpool, omp_get_thread_num())
         }
     } else {
         ggml_threadpool_set_n_threads(threadpool, 1);
-        ggml_graph_compute_thread(threadpool, 0);
+        ggml_threadpool_run(threadpool, 0);
     }
 #else
     if (n_threads > ggml_threadpool_get_n_threads_max(threadpool)) {
@@ -12884,7 +12919,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
-    ggml_graph_compute_thread(threadpool, 0);
+    ggml_threadpool_run(threadpool, 0);
 #endif
 
     // don't leave affinity set on the main thread

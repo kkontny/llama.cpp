@@ -76,6 +76,8 @@ struct ggml_backend_cpu_context {
     uint8_t *           work_data;
     size_t              work_size;
 
+    std::atomic_int     current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.current_chunk
+
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 };
@@ -156,7 +158,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    return ggml_graph_compute(cgraph, cpu_ctx);
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
