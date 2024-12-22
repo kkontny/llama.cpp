@@ -57,7 +57,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Create compute plan
-    struct ggml_cplan cplan = ggml_graph_plan(gf, n_threads, threadpool);
+    struct ggml_cplan cplan = ggml_graph_plan(gf, n_threads);
 
     std::vector<uint8_t> work_data(cplan.work_size);
     cplan.work_data = work_data.data();
@@ -70,12 +70,12 @@ int main(int argc, char *argv[]) {
     // ggml_graph_print(gf);
 
     // Warmup
-    ggml_graph_compute(gf, &cplan);
+    ggml_graph_compute(gf, &cplan, threadpool);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
     for (int i=0; i < n_rounds; i++) {
-        ggml_graph_compute(gf, &cplan);
+        ggml_graph_compute(gf, &cplan, threadpool);
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();

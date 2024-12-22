@@ -114,14 +114,14 @@ static struct ggml_tensor * get_random_tensor_f32(
 }
 
 static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
-    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads, nullptr);
+    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
 
     if (plan.work_size > 0) {
         buf.resize(plan.work_size);
         plan.work_data = buf.data();
     }
 
-    ggml_graph_compute(graph, &plan);
+    ggml_graph_compute(graph, &plan, nullptr);
 }
 
 int main(int /*argc*/, const char ** /*argv*/) {

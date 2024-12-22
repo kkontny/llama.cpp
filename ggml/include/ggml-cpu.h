@@ -14,7 +14,6 @@ extern "C" {
         uint8_t * work_data; // work buffer, to be allocated by caller before calling to `ggml_graph_compute()`
 
         int n_threads;
-        struct ggml_threadpool * threadpool;
 
         // abort ggml_graph_compute when true
         ggml_abort_callback abort_callback;
@@ -62,9 +61,10 @@ extern "C" {
     // when plan.work_size > 0, caller must allocate memory for plan.work_data
     GGML_BACKEND_API struct ggml_cplan ggml_graph_plan(
                   const struct ggml_cgraph * cgraph,
-                                       int   n_threads, /* = GGML_DEFAULT_N_THREADS */
-                    struct ggml_threadpool * threadpool /* = NULL */ );
-    GGML_BACKEND_API enum ggml_status  ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+                                       int   n_threads /* = GGML_DEFAULT_N_THREADS */);
+    GGML_BACKEND_API enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph,
+                  struct ggml_cplan * cplan,
+                  struct ggml_threadpool * threadpool);
 
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data

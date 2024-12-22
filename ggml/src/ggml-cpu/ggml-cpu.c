@@ -13385,15 +13385,8 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
-                               int   n_threads,
-            struct ggml_threadpool * threadpool) {
-
-    if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
-    }
-    if (n_threads <= 0) {
-        n_threads = threadpool ? threadpool->n_threads_max : GGML_DEFAULT_N_THREADS;
-    }
+                               int   n_threads) {
+    GGML_ASSERT(n_threads > 0);
 
     size_t work_size = 0;
 
@@ -13557,7 +13550,6 @@ struct ggml_cplan ggml_graph_plan(
         work_size += CACHE_LINE_SIZE*(n_threads);
     }
 
-    cplan.threadpool = threadpool;
     cplan.n_threads  = MIN(max_tasks, n_threads);
     cplan.work_size  = work_size;
     cplan.work_data  = NULL;
@@ -13817,15 +13809,14 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
-enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan, struct ggml_threadpool * threadpool) {
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
-    int n_threads                               = cplan->n_threads;
-    struct ggml_threadpool * threadpool = cplan->threadpool;
+    int n_threads = cplan->n_threads;
 
     bool disposable_threadpool = false;
 
@@ -13888,11 +13879,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 }
 
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, NULL);
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads);
 
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
 
-    return ggml_graph_compute(cgraph, &cplan);
+    return ggml_graph_compute(cgraph, &cplan, NULL);
 }
 
 
