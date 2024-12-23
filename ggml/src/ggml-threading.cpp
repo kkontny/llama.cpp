@@ -2,8 +2,10 @@
 
 #include "ggml-impl.h"
 
-#include <mutex>
 #include <atomic>
+#include <cstring>
+#include <mutex>
+
 
 #if defined(_WIN32)
 
@@ -42,6 +44,8 @@ static int sched_yield (void) {
 
 #else
 #include <pthread.h>
+
+typedef void * thread_ret_t;
 #endif
 
 //
@@ -112,8 +116,216 @@ void ggml_critical_section_end(void) {
     ggml_critical_section_mutex.unlock();
 }
 
+// Helpers for polling loops
+#if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
+static inline void ggml_thread_cpu_relax(void) {
+    __asm__ volatile("yield" ::: "memory");
+}
+#elif defined(__x86_64__)
+static inline void ggml_thread_cpu_relax(void) {
+    _mm_pause();
+}
+#else
+static inline void ggml_thread_cpu_relax(void) {;}
+#endif
+
+#if defined(_WIN32)
+#include "windows.h"
+
+// TODO: support > 64 CPUs
+static bool ggml_thread_apply_affinity(bool * mask) {
+    HANDLE    h = GetCurrentThread();
+    uint64_t  bitmask = 0ULL;
+
+    assert(GGML_MAX_N_THREADS >= 64);
+
+    for (int32_t i = 0; i < 8; i++) {
+        int32_t idx = i * 8;
+        uint8_t val = 0;
+        val |= mask[idx + 0] << 0;
+        val |= mask[idx + 1] << 1;
+        val |= mask[idx + 2] << 2;
+        val |= mask[idx + 3] << 3;
+        val |= mask[idx + 4] << 4;
+        val |= mask[idx + 5] << 5;
+        val |= mask[idx + 6] << 6;
+        val |= mask[idx + 7] << 7;
+        bitmask |= (uint64_t)val << idx;
+    }
+
+    for (int32_t i = 64; i < GGML_MAX_N_THREADS; i++) {
+        if (mask[i]) {
+            fprintf(stderr, "warn: setting thread-affinity for > 64 CPUs isn't supported on windows!\n");
+            break;
+        }
+    }
+
+    DWORD_PTR m = (DWORD_PTR)bitmask;
+
+    m = SetThreadAffinityMask(h, m);
+
+    return m != 0;
+}
+
+static bool ggml_thread_apply_priority(int32_t prio) {
+    // Note that on Windows the Process Priority Class must be updated in order to set Thread priority.
+    // This is up to the applications.
+    DWORD p = THREAD_PRIORITY_NORMAL;
+    switch (prio) {
+        case GGML_SCHED_PRIO_NORMAL:   p = THREAD_PRIORITY_NORMAL;        break;
+        case GGML_SCHED_PRIO_MEDIUM:   p = THREAD_PRIORITY_ABOVE_NORMAL;  break;
+        case GGML_SCHED_PRIO_HIGH:     p = THREAD_PRIORITY_HIGHEST;       break;
+        case GGML_SCHED_PRIO_REALTIME: p = THREAD_PRIORITY_TIME_CRITICAL; break;
+    }
+
+    if (prio == GGML_SCHED_PRIO_NORMAL) {
+        // Keep inherited policy/priority
+        return true;
+    }
+
+    if (!SetThreadPriority(GetCurrentThread(), p)) {
+        fprintf(stderr, "warn: failed to set thread priority %d : (%d)\n", prio, (int) GetLastError());
+        return false;
+    }
+
+    return true;
+}
+
+#elif defined(__APPLE__)
+#include <sys/types.h>
+#include <sys/resource.h>
+
+static bool ggml_thread_apply_affinity(const bool * mask) {
+    // Not supported on Apple platforms
+    UNUSED(mask);
+    return true;
+}
+
+static bool ggml_thread_apply_priority(int32_t prio) {
+    struct sched_param p;
+    int32_t policy = SCHED_OTHER;
+    switch (prio) {
+        case GGML_SCHED_PRIO_NORMAL:   policy = SCHED_OTHER; p.sched_priority = 0;  break;
+        case GGML_SCHED_PRIO_MEDIUM:   policy = SCHED_FIFO;  p.sched_priority = 40; break;
+        case GGML_SCHED_PRIO_HIGH:     policy = SCHED_FIFO;  p.sched_priority = 80; break;
+        case GGML_SCHED_PRIO_REALTIME: policy = SCHED_FIFO;  p.sched_priority = 90; break;
+    }
+
+    if (prio == GGML_SCHED_PRIO_NORMAL) {
+        // Keep inherited policy/priority
+        return true;
+    }
+
+    int32_t err = pthread_setschedparam(pthread_self(), policy, &p);
+    if (err != 0) {
+        fprintf(stderr, "warn: failed to set thread priority %d : %s (%d)\n", prio, strerror(err), err);
+        return false;
+    }
+
+    return true;
+}
+
+#elif defined(__gnu_linux__)
+// TODO: this may not work on BSD, to be verified
+
+static bool ggml_thread_apply_affinity(const bool * mask) {
+    cpu_set_t cpuset;
+    int err;
+
+    CPU_ZERO(&cpuset);
+
+    for (uint32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
+        if (mask[i]) {
+            GGML_PRINT_DEBUG("Thread %lx: adding %d to cpuset\n", pthread_self(), i);
+            CPU_SET(i, &cpuset);
+        }
+    }
+
+#ifdef __ANDROID__
+    err = sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    if (err < 0) {
+        err = errno;
+    }
+#else
+    err = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#endif
+    if (err != 0) {
+        fprintf(stderr, "warn: failed to set affinity mask 0x%llx : %s (%d)\n", (unsigned long long)mask, strerror(err), err);
+        return false;
+    }
+
+    return true;
+}
+
+static bool ggml_thread_apply_priority(int32_t prio) {
+    struct sched_param p;
+    int32_t policy = SCHED_OTHER;
+    switch (prio) {
+        case GGML_SCHED_PRIO_NORMAL:   policy = SCHED_OTHER; p.sched_priority = 0;  break;
+        case GGML_SCHED_PRIO_MEDIUM:   policy = SCHED_FIFO;  p.sched_priority = 40; break;
+        case GGML_SCHED_PRIO_HIGH:     policy = SCHED_FIFO;  p.sched_priority = 80; break;
+        case GGML_SCHED_PRIO_REALTIME: policy = SCHED_FIFO;  p.sched_priority = 90; break;
+    }
+
+    if (prio == GGML_SCHED_PRIO_NORMAL) {
+        // Keep inherited policy/priority
+        return true;
+    }
+
+    int32_t err = pthread_setschedparam(pthread_self(), policy, &p);
+    if (err != 0) {
+        fprintf(stderr, "warn: failed to set thread priority %d : %s (%d)\n", prio, strerror(err), err);
+        return false;
+    }
+
+    return true;
+}
+
+#else // unsupported platforms
+
+static bool ggml_thread_apply_affinity(const bool * mask) {
+    UNUSED(mask);
+    return true;
+}
+
+static bool ggml_thread_apply_priority(int32_t prio) {
+    UNUSED(prio);
+    return true;
+}
+
+#endif
+
+static bool ggml_thread_cpumask_is_valid(const bool * mask) {
+    for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
+        if (mask[i]) { return true; }
+    }
+    return false;
+}
+
+static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
+    if (!strict) {
+        std::memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
+        return;
+    } else {
+        std::memset(local_mask, 0, GGML_MAX_N_THREADS);
+        int32_t base_idx = *iter;
+        for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
+            int32_t idx = base_idx + i;
+            if (idx >= GGML_MAX_N_THREADS) {
+                // Just a cheaper modulo
+                idx -= GGML_MAX_N_THREADS;
+            }
+            if (global_mask[idx]) {
+                local_mask[idx] = 1;
+                *iter = idx + 1;
+                return;
+            }
+        }
+    }
+}
+
 // Threadpool def
-struct ggml_threadpool {
+struct alignas(std::hardware_destructive_interference_size) ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
 
@@ -131,7 +343,8 @@ struct ggml_threadpool {
     std::atomic_bool abort;        // Used for aborting processing of a graph
 
     struct ggml_compute_state * workers;   // per thread state
-    int          n_threads_max; // number of threads in the pool
+    void * (*compute_thread)(void * data); // function which each thread
+    int               n_threads_max; // number of threads in the pool
     std::atomic_int   n_threads_cur; // number of threads used in the current graph
 
     int32_t      prio;        // Scheduling priority
@@ -141,7 +354,7 @@ struct ggml_threadpool {
 };
 
 // Per-thread state
-struct ggml_compute_state {
+struct alignas(std::hardware_destructive_interference_size) ggml_compute_state {
 #ifndef GGML_USE_OPENMP
     ggml_thread_t thrd;
     bool cpumask[GGML_MAX_N_THREADS];
@@ -151,3 +364,253 @@ struct ggml_compute_state {
     struct ggml_threadpool * threadpool;
     int ith;
 };
+
+// check if thread is active
+static inline bool ggml_graph_compute_thread_active(struct ggml_compute_state * state) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+    int n_threads = std::atomic_load_explicit(&threadpool->n_threads_cur, std::memory_order_relaxed);
+    return (state->ith < n_threads);
+}
+
+// check if thread is ready to proceed (exit from polling or sleeping)
+static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * state) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+
+    if (state->pending || threadpool->stop || threadpool->pause) { return true; }
+
+    // check for new graph/work
+    int new_graph = std::atomic_load_explicit(&threadpool->n_graph, std::memory_order_relaxed);
+    if (new_graph != state->last_graph) {
+        state->pending    = ggml_graph_compute_thread_active(state);
+        state->last_graph = new_graph;
+    }
+
+    return state->pending;
+}
+
+// sync thread state after polling
+static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state *) {
+    // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
+    #ifdef GGML_TSAN_ENABLED
+    std::atomic_fetch_add_explicit(&state->threadpool->n_graph, 0, std::memory_order_seq_cst);
+    #else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    #endif
+}
+
+static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * state) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+
+    // Skip polling for unused threads
+    if (!ggml_graph_compute_thread_active(state)) {
+        return state->pending;
+    }
+
+    // This seems to make 0 ... 100 a decent range for polling level across modern processors.
+    // Perhaps, we can adjust it dynamically based on load and things.
+    const uint64_t n_rounds = 1024UL * 128 * threadpool->poll;
+
+    for (uint64_t i=0; !ggml_graph_compute_thread_ready(state) && i < n_rounds; i++) {
+        // No new work. Keep polling.
+        ggml_thread_cpu_relax();
+    }
+
+    return state->pending;
+}
+
+static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
+    struct ggml_threadpool * threadpool = state->threadpool;
+
+    if (ggml_graph_compute_poll_for_work(state)) {
+        ggml_graph_compute_thread_sync(state);
+        return state->pending;
+    }
+
+    ggml_mutex_lock_shared(&threadpool->mutex);
+    while (!ggml_graph_compute_thread_ready(state)) {
+        // No new work. Wait for the signal.
+        GGML_PRINT_DEBUG("thread #%d waiting for work (sleeping)\n", state->ith);
+        ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
+    }
+    ggml_mutex_unlock_shared(&threadpool->mutex);
+
+    return state->pending;
+}
+
+static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
+    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+    struct ggml_threadpool * threadpool = state->threadpool;
+
+    ggml_thread_apply_priority(threadpool->prio);
+    if (ggml_thread_cpumask_is_valid(state->cpumask)) {
+        ggml_thread_apply_affinity(state->cpumask);
+    }
+
+    GGML_ASSERT(threadpool->compute_thread);
+
+    while (true) {
+        // Check if we need to sleep
+        while (threadpool->pause) {
+            GGML_PRINT_DEBUG("thread #%d inside pause loop\n", state->ith);
+            ggml_mutex_lock_shared(&threadpool->mutex);
+            if (threadpool->pause) {
+                ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
+            }
+            GGML_PRINT_DEBUG("thread #%d resuming after wait\n", state->ith);
+            ggml_mutex_unlock_shared(&threadpool->mutex);
+        }
+
+        // This needs to be checked for after the cond_wait
+        if (threadpool->stop) break;
+
+        // Check if there is new work
+        // The main thread is the only one that can dispatch new work
+
+        ggml_graph_compute_check_for_work(state);
+        if (state->pending) {
+            state->pending = false;
+
+            threadpool->compute_thread(state);
+        }
+    }
+
+    return (thread_ret_t) 0;
+}
+
+static struct ggml_threadpool * ggml_threadpool_new_impl(
+    struct ggml_threadpool_params * tpp,
+               struct ggml_cgraph * cgraph) {
+
+    struct ggml_threadpool * threadpool = new ggml_threadpool;
+    {
+        threadpool->cgraph           = cgraph;
+        threadpool->n_graph          = 0;
+        threadpool->n_barrier        = 0;
+        threadpool->n_barrier_passed = 0;
+        threadpool->current_chunk    = 0;
+        threadpool->stop             = false;
+        threadpool->pause            = tpp->paused;
+        threadpool->abort            = false;
+        threadpool->workers          = nullptr;
+        threadpool->compute_thread   = nullptr;
+        threadpool->n_threads_max    = tpp->n_threads;
+        threadpool->n_threads_cur    = tpp->n_threads;
+        threadpool->poll             = tpp->poll;
+        threadpool->prio             = tpp->prio;
+        threadpool->ec               = GGML_STATUS_SUCCESS;
+    }
+
+    // Allocate and init workers state
+    const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
+    struct ggml_compute_state * workers = new ggml_compute_state[tpp->n_threads];
+
+    std::memset(workers, 0, workers_size);
+    for (int j = 0; j < tpp->n_threads; j++) {
+        workers[j].threadpool = threadpool;
+        workers[j].ith        = j;
+    }
+
+    threadpool->workers = workers;
+
+#ifndef GGML_USE_OPENMP
+    ggml_mutex_init(&threadpool->mutex);
+    ggml_cond_init(&threadpool->cond);
+
+    // Spin the threads for all workers, and update CPU placements.
+    // Place the main thread last (towards the higher numbered CPU cores).
+
+    int32_t cpumask_iter = 0;
+
+    for (int j = 1; j < tpp->n_threads; j++) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+
+        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
+        GGML_ASSERT(rc == 0);
+    }
+
+    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+
+    if (!threadpool->pause) {
+        // Update main thread prio and affinity at the start, otherwise we'll do it in resume
+        ggml_thread_apply_priority(threadpool->prio);
+        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
+            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
+        }
+    }
+#endif // GGML_USE_OPENMP
+
+    return threadpool;
+}
+
+struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
+    return ggml_threadpool_new_impl(tpp, NULL);
+}
+
+void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
+    if (!threadpool) return;
+
+    const int n_threads = threadpool->n_threads_max;
+
+#ifndef GGML_USE_OPENMP
+    struct ggml_compute_state* workers = threadpool->workers;
+
+    ggml_mutex_lock(&threadpool->mutex);
+
+    threadpool->stop = true;
+    threadpool->pause = false;
+
+    ggml_cond_broadcast(&threadpool->cond);
+    ggml_mutex_unlock(&threadpool->mutex);
+
+    for (int j = 1; j < n_threads; j++) {
+        int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
+        GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
+    }
+
+    ggml_mutex_destroy(&threadpool->mutex);
+    ggml_cond_destroy(&threadpool->cond);
+#endif // GGML_USE_OPENMP
+
+    const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
+    ggml_aligned_free(threadpool->workers, workers_size);
+    ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
+}
+
+#ifndef GGML_USE_OPENMP
+// pause/resume must be called under mutex
+static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
+    GGML_PRINT_DEBUG("Pausing threadpool\n");
+    threadpool->pause = true;
+    ggml_cond_broadcast(&threadpool->cond);
+}
+
+static void ggml_threadpool_resume_locked(struct ggml_threadpool * threadpool) {
+    GGML_PRINT_DEBUG("Resuming threadpool\n");
+    threadpool->pause = false;
+    ggml_cond_broadcast(&threadpool->cond);
+}
+#endif
+
+void ggml_threadpool_pause(struct ggml_threadpool * threadpool) {
+#ifndef GGML_USE_OPENMP
+    ggml_mutex_lock(&threadpool->mutex);
+    if (!threadpool->pause) {
+       ggml_threadpool_pause_locked(threadpool);
+    }
+    ggml_mutex_unlock(&threadpool->mutex);
+#else
+    UNUSED(threadpool);
+#endif
+}
+
+void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
+#ifndef GGML_USE_OPENMP
+    ggml_mutex_lock(&threadpool->mutex);
+    if (threadpool->pause) {
+       ggml_threadpool_resume_locked(threadpool);
+    }
+    ggml_mutex_unlock(&threadpool->mutex);
+#else
+    UNUSED(threadpool);
+#endif
+}
