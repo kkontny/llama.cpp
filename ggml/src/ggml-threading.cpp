@@ -1,5 +1,9 @@
 #include "ggml-threading.h"
+
+#include "ggml-impl.h"
+
 #include <mutex>
+#include <atomic>
 
 #if defined(_WIN32)
 
@@ -107,3 +111,43 @@ void ggml_critical_section_start() {
 void ggml_critical_section_end(void) {
     ggml_critical_section_mutex.unlock();
 }
+
+// Threadpool def
+struct ggml_threadpool {
+    ggml_mutex_t mutex;       // mutex for cond.var
+    ggml_cond_t  cond;        // cond.var for waiting for new work
+
+    struct ggml_cgraph * cgraph;
+
+    // synchronization primitives
+    std::atomic_int n_graph;       // incremented when there is work to be done (i.e each graph)
+    alignas(std::hardware_destructive_interference_size) std::atomic_int n_barrier;
+    alignas(std::hardware_destructive_interference_size) std::atomic_int n_barrier_passed;
+    std::atomic_int current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+
+    // these are atomic as an annotation for thread-sanitizer
+    std::atomic_bool stop;         // Used for stopping the threadpool altogether
+    std::atomic_bool pause;        // Used for pausing the threadpool or individual threads
+    std::atomic_bool abort;        // Used for aborting processing of a graph
+
+    struct ggml_compute_state * workers;   // per thread state
+    int          n_threads_max; // number of threads in the pool
+    std::atomic_int   n_threads_cur; // number of threads used in the current graph
+
+    int32_t      prio;        // Scheduling priority
+    uint32_t     poll;        // Polling level (0 - no polling)
+
+    enum ggml_status ec;
+};
+
+// Per-thread state
+struct ggml_compute_state {
+#ifndef GGML_USE_OPENMP
+    ggml_thread_t thrd;
+    bool cpumask[GGML_MAX_N_THREADS];
+    int  last_graph;
+    bool pending;
+#endif
+    struct ggml_threadpool * threadpool;
+    int ith;
+};
