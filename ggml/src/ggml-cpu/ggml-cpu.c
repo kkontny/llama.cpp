@@ -1231,8 +1231,6 @@ static inline void __lsx_f16x4_store(ggml_fp16_t * x, __m128 y) {
 // Threading defs
 //
 
-typedef pthread_t          ggml_thread_t;
-
 #if defined(_WIN32)
 
 typedef CONDITION_VARIABLE ggml_cond_t;
