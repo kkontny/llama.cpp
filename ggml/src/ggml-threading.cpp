@@ -543,7 +543,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 }
 
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
-    return ggml_threadpool_new_impl(tpp, NULL);
+    return ggml_threadpool_new_impl(tpp, nullptr);
 }
 
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
@@ -613,4 +613,46 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #else
     UNUSED(threadpool);
 #endif
+}
+
+// Start processing new graph
+void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads) {
+    // Always take the mutex here because the worker threads are doing hybrid poll/wait
+
+    ggml_mutex_lock(&threadpool->mutex);
+
+    GGML_PRINT_DEBUG("threadpool: n_threads_cur %d n_threads %d\n", threadpool->n_threads_cur, n_threads);
+
+    // Update the number of active threads
+    atomic_store_explicit(&threadpool->n_threads_cur, n_threads, std::memory_order_relaxed);
+
+    // Indicate the graph is ready to be processed
+    // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
+    atomic_fetch_add_explicit(&threadpool->n_graph, 1, std::memory_order_seq_cst);
+
+    if (threadpool->pause) {
+       // Update main thread prio and affinity to match the threadpool settings
+       ggml_thread_apply_priority(threadpool->prio);
+       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
+           ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
+       }
+
+       // resume does cond broadcast
+       ggml_threadpool_resume_locked(threadpool);
+    } else {
+       ggml_cond_broadcast(&threadpool->cond);
+    }
+
+    ggml_mutex_unlock(&threadpool->mutex);
+}
+
+void ggml_threadpool_reset(struct ggml_threadpool * threadpool, struct ggml_cgraph * cgraph) {
+    threadpool->cgraph           = cgraph;
+    threadpool->current_chunk    = 0;
+    threadpool->abort            = false;
+    threadpool->ec               = GGML_STATUS_SUCCESS;
+}
+
+void ggml_threadpool_set_craph (struct ggml_threadpool * threadpool, struct ggml_cgraph * cgraph) {
+    threadpool->cgraph = cgraph;
 }

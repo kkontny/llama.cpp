@@ -13702,38 +13702,6 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     return (thread_ret_t) 0;
 }
 
-// Start processing new graph
-static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
-{
-    // Always take the mutex here because the worker threads are doing hybrid poll/wait
-
-    ggml_mutex_lock(&threadpool->mutex);
-
-    GGML_PRINT_DEBUG("threadpool: n_threads_cur %d n_threads %d\n", threadpool->n_threads_cur, n_threads);
-
-    // Update the number of active threads
-    atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
-
-    // Indicate the graph is ready to be processed
-    // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
-    atomic_fetch_add_explicit(&threadpool->n_graph, 1, memory_order_seq_cst);
-
-    if (threadpool->pause) {
-       // Update main thread prio and affinity to match the threadpool settings
-       ggml_thread_apply_priority(threadpool->prio);
-       if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-           ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
-       }
-
-       // resume does cond broadcast
-       ggml_threadpool_resume_locked(threadpool);
-    } else {
-       ggml_cond_broadcast(&threadpool->cond);
-    }
-
-    ggml_mutex_unlock(&threadpool->mutex);
-}
-
 #endif // GGML_USE_OPENMP
 
 static struct ggml_threadpool * ggml_threadpool_new_impl(
@@ -13803,10 +13771,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     return threadpool;
 }
 
-struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
-    return ggml_threadpool_new_impl(tpp, NULL, NULL);
-}
-
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan, struct ggml_threadpool * threadpool) {
     ggml_cpu_init();
 
@@ -13823,15 +13787,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
-        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        threadpool = ggml_threadpool_new(&ttp);
+        ggml_threadpool_set_craph(threadpool, cgraph);
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
-        threadpool->cgraph           = cgraph;
-        threadpool->cplan            = cplan;
-        threadpool->current_chunk    = 0;
-        threadpool->abort            = false;
-        threadpool->ec               = GGML_STATUS_SUCCESS;
+        ggml_threadpool_reset(threadpool, cgraph);
     }
 
 #ifdef GGML_USE_OPENMP

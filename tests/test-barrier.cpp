@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
+#include "ggml-threading.h"
 
 #include <chrono>
 #include <iostream>
